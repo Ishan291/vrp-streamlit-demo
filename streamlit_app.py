@@ -22,22 +22,23 @@ st.title("🚚 Multi-Trip VRP Simulator (Near & Far Orders)")
 depot_lat, depot_lon = 12.9716, 77.5946  # Bengaluru Depot
 
 # === Generate Orders ===
+num_orders = st.sidebar.slider("Number of Orders", 10, 200, 100, step=10)
 @st.cache_data
-def generate_orders():
+def generate_orders(num_orders):
     np.random.seed(42)
     orders = pd.DataFrame({
-        'order_id': range(1, 101),
-        'latitude': depot_lat + np.random.uniform(-0.03, 0.03, 100),
-        'longitude': depot_lon + np.random.uniform(-0.02, 0.061, 100),
-        'volume': np.random.randint(1, 10, 100),
-        'weight': np.random.randint(1, 20, 100)
+        'order_id': range(1, num_orders+1),
+        'latitude': depot_lat + np.random.uniform(-0.03, 0.03, num_orders),
+        'longitude': depot_lon + np.random.uniform(-0.02, 0.061, num_orders),
+        'volume': np.random.randint(1, 10, num_orders),
+        'weight': np.random.randint(1, 20, num_orders)
     })
     orders['distance_from_depot'] = orders.apply(
         lambda row: great_circle((depot_lat, depot_lon), (row['latitude'], row['longitude'])).km, axis=1
     )
     return orders
 
-orders = generate_orders()
+orders = generate_orders(num_orders)
 near_orders = orders[orders['distance_from_depot'] < 5].reset_index(drop=True)
 far_orders = orders[orders['distance_from_depot'] >= 5].reset_index(drop=True)
 
