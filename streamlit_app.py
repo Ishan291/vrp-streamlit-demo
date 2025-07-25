@@ -108,7 +108,7 @@ def create_schedule(vehicle_routes, distance_matrix, virtual_vehicle_count, real
 
     for virtual_vehicle_id, route in vehicle_routes.items():
         real_vehicle_id = (virtual_vehicle_id) % real_vehicle_count + 1
-        trip_number = (virtual_vehicle_id) // real_vehicle_count + 1
+        trip_number = len(schedule[real_vehicle_id]) + 1
         trip_time_minutes = 0
         route_stops = ["Depot"]
         for i in range(len(route) - 1):
