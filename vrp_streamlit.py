@@ -1,142 +1,134 @@
 import streamlit as st
-import time, random
+import random, time
 from datetime import datetime, timedelta
 from geopy.distance import geodesic
-import folium
-from streamlit_folium import st_folium
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# ---------------- CONFIG ---------------- #
+st.title("🚚 VRP Simulation App")
+
+# ---------------- PARAMETERS ---------------- #
+num_vehicles = st.sidebar.number_input("Number of Vehicles", min_value=1, max_value=10, value=3)
+vehicle_speed = st.sidebar.number_input("Vehicle Speed (km/h)", min_value=10, max_value=5000, value=3000)
+max_orders_per_vehicle = st.sidebar.number_input("Max Orders per Vehicle", min_value=1, max_value=10, value=3)
+initial_orders = st.sidebar.number_input("Initial Orders", min_value=1, max_value=20, value=5)
+sim_speed = st.sidebar.number_input("Simulation Speed (sec)", min_value=1, max_value=10, value=1)
+
 DEPOT_LOCATION = (12.9716, 77.5946)
-NUM_VEHICLES = 3
-REFRESH_INTERVAL = 5  # seconds between updates
-VEHICLE_SPEED = 30  # km/h (for ETA simulation)
 
 # ---------------- SESSION STATE ---------------- #
-if "orders" not in st.session_state:
-    st.session_state.orders = []
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-if "vehicles" not in st.session_state:
-    st.session_state.vehicles = [
-        {"id": i, "status": "Available", "route": [], "eta": None}
-        for i in range(NUM_VEHICLES)
+if "all_orders" not in st.session_state:
+    st.session_state.all_orders = []
+if "available_virtual_vehicles" not in st.session_state:
+    st.session_state.available_virtual_vehicles = []
+if "out_for_delivery" not in st.session_state:
+    st.session_state.out_for_delivery = []
+if "delivery_log" not in st.session_state:
+    st.session_state.delivery_log = []
+if "vehicle_pool" not in st.session_state:
+    st.session_state.vehicle_pool = [
+        {"id": f"V{i+1}", "max_vol": 100, "max_weight": 200, "available_at": datetime.now(), "trip_count": 0}
+        for i in range(num_vehicles)
     ]
 
 # ---------------- HELPERS ---------------- #
-def create_random_order():
+def travel_time_km(loc1, loc2):
+    distance_km = geodesic(loc1, loc2).km
+    return (distance_km / vehicle_speed) * 60  # minutes
+
+def generate_random_order(i):
+    lat = round(random.uniform(12.95, 12.99), 5)
+    lon = round(random.uniform(77.55, 77.65), 5)
+    priority = random.choice([1, 2])
+    wait_time = 30 if priority == 1 else 60
     return {
-        "id": len(st.session_state.orders) + 1,
-        "lat": DEPOT_LOCATION[0] + random.uniform(-0.05, 0.05),
-        "lon": DEPOT_LOCATION[1] + random.uniform(-0.05, 0.05),
-        "time": datetime.now()
+        "id": f"O{i}",
+        "location": (lat, lon),
+        "volume": random.randint(10, 30),
+        "weight": random.randint(5, 20),
+        "priority": priority,
+        "wait_time": wait_time,
+        "arrival_time": datetime.now()
     }
 
-def build_distance_matrix(orders, depot):
-    locations = [depot] + [(o["lat"], o["lon"]) for o in orders]
-    n = len(locations)
-    matrix = [[0]*n for _ in range(n)]
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                matrix[i][j] = geodesic(locations[i], locations[j]).km
-    return matrix
+def can_reach_in_time(order, depot, vehicle_available_at):
+    travel_minutes = travel_time_km(depot, order["location"])
+    latest_delivery = order["arrival_time"] + timedelta(minutes=order["wait_time"])
+    expected_delivery = vehicle_available_at + timedelta(minutes=travel_minutes)
+    return expected_delivery <= latest_delivery
 
-def solve_vrp(distance_matrix, num_vehicles, depot=0):
-    manager = pywrapcp.RoutingIndexManager(len(distance_matrix), num_vehicles, depot)
+# ---------------- VRP SOLVER ---------------- #
+def assign_orders(orders, vehicles):
+    if not orders or not vehicles:
+        return []
+    
+    all_locations = [DEPOT_LOCATION] + [o["location"] for o in orders]
+    distance_matrix = [
+        [int(geodesic(loc1, loc2).km*1000) for loc2 in all_locations]
+        for loc1 in all_locations
+    ]
+    volumes = [o["volume"] for o in orders]
+    weights = [o["weight"] for o in orders]
+
+    manager = pywrapcp.RoutingIndexManager(len(distance_matrix), len(vehicles), 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
-        return int(distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)] * 1000)
+        return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+    
+    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(distance_callback))
 
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    def demand_callback(from_index):
+        node = manager.IndexToNode(from_index)
+        return 0 if node==0 else 1
+    
+    routing.AddDimensionWithVehicleCapacity(
+        routing.RegisterUnaryTransitCallback(demand_callback),
+        0,
+        [max_orders_per_vehicle]*len(vehicles),
+        True,
+        "OrderCount"
+    )
 
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-
-    solution = routing.SolveWithParameters(search_parameters)
-    routes = []
+    solution = routing.SolveWithParameters(pywrapcp.DefaultRoutingSearchParameters())
+    assignments = []
     if solution:
-        for vehicle_id in range(num_vehicles):
-            index = routing.Start(vehicle_id)
+        for v_id in range(len(vehicles)):
+            index = routing.Start(v_id)
             route = []
             while not routing.IsEnd(index):
-                route.append(manager.IndexToNode(index))
+                node = manager.IndexToNode(index)
+                if node!=0:
+                    route.append(orders[node-1])
                 index = solution.Value(routing.NextVar(index))
-            routes.append(route)
-    return routes
+            if route:
+                assignments.append((vehicles[v_id], route))
+    return assignments
 
-def estimate_eta(route, distance_matrix):
-    total_km = 0
-    for i in range(len(route)-1):
-        total_km += distance_matrix[route[i]][route[i+1]]
-    hours = total_km / VEHICLE_SPEED
-    return datetime.now() + timedelta(hours=hours)
+# ---------------- SIMULATION ---------------- #
+if st.button("Start Simulation"):
+    # Generate initial orders
+    for i in range(initial_orders):
+        st.session_state.all_orders.append(generate_random_order(i))
 
-# ---------------- SIMULATION STEP ---------------- #
-# Random new orders
-if random.random() < 0.4:  # 40% chance new order
-    new_order = create_random_order()
-    st.session_state.orders.append(new_order)
-    st.session_state.logs.append({"time": datetime.now(), "action": f"New order {new_order['id']} created"})
+    order_id = initial_orders
+    for step in range(10):  # simulate 10 steps
+        st.write(f"### Step {step+1}")
+        # Random new order
+        if random.random() < 0.5:
+            new_order = generate_random_order(order_id)
+            st.session_state.all_orders.append(new_order)
+            st.write(f"New Order: {new_order['id']} | Priority: {new_order['priority']}")
+            order_id += 1
+        
+        # Assign available vehicles
+        available_vehicles = [v for v in st.session_state.vehicle_pool if v["available_at"] <= datetime.now() and v["trip_count"]<3]
+        valid_orders = [o for o in st.session_state.all_orders if can_reach_in_time(o, DEPOT_LOCATION, datetime.now())]
+        assignments = assign_orders(valid_orders, available_vehicles)
 
-# Update vehicle statuses
-for v in st.session_state.vehicles:
-    if v["status"] == "Out for Delivery" and v["eta"] and datetime.now() >= v["eta"]:
-        v["status"] = "Returning"
-        v["eta"] = datetime.now() + timedelta(minutes=2)  # 2 min return time
-        st.session_state.logs.append({"time": datetime.now(), "action": f"Vehicle {v['id']} finished delivery, returning"})
-
-    elif v["status"] == "Returning" and v["eta"] and datetime.now() >= v["eta"]:
-        v["status"] = "Available"
-        v["route"] = []
-        v["eta"] = None
-        st.session_state.logs.append({"time": datetime.now(), "action": f"Vehicle {v['id']} is now available"})
-
-# Assign new routes if available vehicles + pending orders
-available_vehicles = [v for v in st.session_state.vehicles if v["status"] == "Available"]
-if st.session_state.orders and available_vehicles:
-    dist_matrix = build_distance_matrix(st.session_state.orders, DEPOT_LOCATION)
-    routes = solve_vrp(dist_matrix, NUM_VEHICLES)
-
-    for v, route in zip(st.session_state.vehicles, routes):
-        if v["status"] == "Available" and len(route) > 1:
-            v["route"] = route
-            v["status"] = "Out for Delivery"
-            v["eta"] = estimate_eta(route, dist_matrix)
-            st.session_state.logs.append({"time": datetime.now(), "action": f"Vehicle {v['id']} dispatched with route {route}"})
-
-# ---------------- DISPLAY ---------------- #
-st.title("🚚 Dynamic VRP Simulation with Vehicle States")
-
-# Map
-m = folium.Map(location=DEPOT_LOCATION, zoom_start=13)
-folium.Marker(DEPOT_LOCATION, tooltip="Depot", icon=folium.Icon(color="red")).add_to(m)
-
-for o in st.session_state.orders:
-    folium.Marker((o["lat"], o["lon"]), tooltip=f"Order {o['id']}").add_to(m)
-
-colors = ["blue", "green", "purple"]
-for v in st.session_state.vehicles:
-    if v["route"]:
-        coords = [DEPOT_LOCATION] + [(st.session_state.orders[i-1]["lat"], st.session_state.orders[i-1]["lon"]) for i in v["route"] if i != 0]
-        folium.PolyLine(coords, color=colors[v["id"] % len(colors)], weight=3).add_to(m)
-
-st_folium(m, width=700, height=500)
-
-# Vehicle table
-st.subheader("🚛 Vehicle Status")
-st.table([{"Vehicle": v["id"], "Status": v["status"], "ETA": v["eta"]} for v in st.session_state.vehicles])
-
-# Orders
-st.subheader("📦 Orders")
-st.write(st.session_state.orders)
-
-# Logs
-st.subheader("📝 Logs")
-st.write(st.session_state.logs)
-
-# Auto-refresh
-time.sleep(REFRESH_INTERVAL)
-st.experimental_rerun()
+        for v, orders_assigned in assignments:
+            total_route_minutes = sum(travel_time_km(DEPOT_LOCATION, o["location"]) for o in orders_assigned)
+            v["available_at"] = datetime.now() + timedelta(minutes=total_route_minutes)
+            v["trip_count"] += 1
+            st.write(f"🚚 Vehicle {v['id']} dispatched: {[o['id'] for o in orders_assigned]}")
+        
+        time.sleep(sim_speed)
