@@ -4,36 +4,40 @@ from datetime import datetime, timedelta
 from geopy.distance import geodesic
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-st.title("🚚 VRP Simulation App")
+st.title("🚚 Vehicle Routing Simulation")
 
 # ---------------- PARAMETERS ---------------- #
 num_vehicles = st.sidebar.number_input("Number of Vehicles", min_value=1, max_value=10, value=3)
 vehicle_speed = st.sidebar.number_input("Vehicle Speed (km/h)", min_value=10, max_value=5000, value=3000)
 max_orders_per_vehicle = st.sidebar.number_input("Max Orders per Vehicle", min_value=1, max_value=10, value=3)
 initial_orders = st.sidebar.number_input("Initial Orders", min_value=1, max_value=20, value=5)
-sim_speed = st.sidebar.number_input("Simulation Speed (sec)", min_value=1, max_value=10, value=1)
+sim_speed = st.sidebar.number_input("Simulation Step Interval (sec)", min_value=1, max_value=10, value=1)
 
 DEPOT_LOCATION = (12.9716, 77.5946)
 
 # ---------------- SESSION STATE ---------------- #
 if "all_orders" not in st.session_state:
     st.session_state.all_orders = []
+if "vehicle_pool" not in st.session_state:
+    st.session_state.vehicle_pool = [
+        {"id": f"V{i+1}", "max_vol": 100, "max_weight": 200, "available_at": datetime.now(), "trip_count": 0}
+        for i in range(num_vehicles)
+    ]
 if "available_virtual_vehicles" not in st.session_state:
     st.session_state.available_virtual_vehicles = []
 if "out_for_delivery" not in st.session_state:
     st.session_state.out_for_delivery = []
 if "delivery_log" not in st.session_state:
     st.session_state.delivery_log = []
-if "vehicle_pool" not in st.session_state:
-    st.session_state.vehicle_pool = [
-        {"id": f"V{i+1}", "max_vol": 100, "max_weight": 200, "available_at": datetime.now(), "trip_count": 0}
-        for i in range(num_vehicles)
-    ]
+if "order_id" not in st.session_state:
+    st.session_state.order_id = 0
+
+output_area = st.empty()  # placeholder for simulation output
 
 # ---------------- HELPERS ---------------- #
 def travel_time_km(loc1, loc2):
     distance_km = geodesic(loc1, loc2).km
-    return (distance_km / vehicle_speed) * 60  # minutes
+    return (distance_km / vehicle_speed) * 60  # in minutes
 
 def generate_random_order(i):
     lat = round(random.uniform(12.95, 12.99), 5)
@@ -60,7 +64,7 @@ def can_reach_in_time(order, depot, vehicle_available_at):
 def assign_orders(orders, vehicles):
     if not orders or not vehicles:
         return []
-    
+
     all_locations = [DEPOT_LOCATION] + [o["location"] for o in orders]
     distance_matrix = [
         [int(geodesic(loc1, loc2).km*1000) for loc2 in all_locations]
@@ -74,13 +78,13 @@ def assign_orders(orders, vehicles):
 
     def distance_callback(from_index, to_index):
         return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-    
+
     routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(distance_callback))
 
     def demand_callback(from_index):
         node = manager.IndexToNode(from_index)
         return 0 if node==0 else 1
-    
+
     routing.AddDimensionWithVehicleCapacity(
         routing.RegisterUnaryTransitCallback(demand_callback),
         0,
@@ -104,31 +108,48 @@ def assign_orders(orders, vehicles):
                 assignments.append((vehicles[v_id], route))
     return assignments
 
-# ---------------- SIMULATION ---------------- #
-if st.button("Start Simulation"):
-    # Generate initial orders
-    for i in range(initial_orders):
-        st.session_state.all_orders.append(generate_random_order(i))
+# ---------------- SIMULATION STEP ---------------- #
+def simulation_step():
+    output_text = []
 
-    order_id = initial_orders
-    for step in range(10):  # simulate 10 steps
-        st.write(f"### Step {step+1}")
-        # Random new order
-        if random.random() < 0.5:
-            new_order = generate_random_order(order_id)
-            st.session_state.all_orders.append(new_order)
-            st.write(f"New Order: {new_order['id']} | Priority: {new_order['priority']}")
-            order_id += 1
-        
-        # Assign available vehicles
-        available_vehicles = [v for v in st.session_state.vehicle_pool if v["available_at"] <= datetime.now() and v["trip_count"]<3]
-        valid_orders = [o for o in st.session_state.all_orders if can_reach_in_time(o, DEPOT_LOCATION, datetime.now())]
-        assignments = assign_orders(valid_orders, available_vehicles)
+    # Generate new order
+    if random.random() < 0.7:  # 70% chance of new order
+        new_order = generate_random_order(st.session_state.order_id)
+        st.session_state.all_orders.append(new_order)
+        output_text.append(f"📦 New Order: {new_order['id']} | Priority: {new_order['priority']}")
+        st.session_state.order_id += 1
 
-        for v, orders_assigned in assignments:
-            total_route_minutes = sum(travel_time_km(DEPOT_LOCATION, o["location"]) for o in orders_assigned)
-            v["available_at"] = datetime.now() + timedelta(minutes=total_route_minutes)
-            v["trip_count"] += 1
-            st.write(f"🚚 Vehicle {v['id']} dispatched: {[o['id'] for o in orders_assigned]}")
-        
-        time.sleep(sim_speed)
+    # Available vehicles
+    available_vehicles = [v for v in st.session_state.vehicle_pool if v["available_at"] <= datetime.now() and v["trip_count"]<3]
+    valid_orders = [o for o in st.session_state.all_orders if can_reach_in_time(o, DEPOT_LOCATION, datetime.now()) and o["id"] not in [d["order_id"] for d in st.session_state.delivery_log]]
+
+    # Assign orders
+    assignments = assign_orders(valid_orders, available_vehicles)
+    for v, orders_assigned in assignments:
+        route_time = sum(travel_time_km(DEPOT_LOCATION, o["location"]) for o in orders_assigned)
+        v["available_at"] = datetime.now() + timedelta(minutes=route_time)
+        v["trip_count"] += 1
+        st.session_state.out_for_delivery.append({
+            "vehicle": v["id"],
+            "orders": [o["id"] for o in orders_assigned],
+            "return_at": v["available_at"]
+        })
+        for o in orders_assigned:
+            st.session_state.delivery_log.append({
+                "order_id": o["id"],
+                "vehicle_id": v["id"],
+                "delivered_at": datetime.now()
+            })
+        output_text.append(f"🚚 Vehicle {v['id']} dispatched: {[o['id'] for o in orders_assigned]}")
+
+    # Check returned vehicles
+    for v in st.session_state.out_for_delivery:
+        if v["return_at"] <= datetime.now():
+            output_text.append(f"✅ Vehicle {v['vehicle']} RETURNED | Orders Delivered: {v['orders']}")
+    st.session_state.out_for_delivery = [v for v in st.session_state.out_for_delivery if v["return_at"] > datetime.now()]
+
+    output_area.text("\n".join(output_text))
+
+# ---------------- RUN SIMULATION ---------------- #
+if st.button("Run Simulation Step"):
+    simulation_step()
